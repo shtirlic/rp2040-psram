@@ -24,9 +24,13 @@ SOFTWARE.
 
 ******************************************************************************/
 #include "psram_spi.h"
+#include <stdio.h>                  //in test_psram the printf is more than reasonable
+
+#define PSRAM_CKDIV     1.5f        //it may need adjustment based on the used chip and wiring
+                                    //if communication is unpredictable/unstable, increase this valéue (also try adding more capacitor next to the PSRAM chip)
+#define PSRAM_ID_DEBUG
 
 #ifdef PSRAM_DEBUG
-#include <stdio.h>
 #define PSRAM_DBG_PRINTF(fmt, ...)  printf(fmt, ##__VA_ARGS__)
 #define PSRAM_DBG_PUTS(s)           puts(s)
 #else
@@ -55,16 +59,19 @@ void __isr psram_dma_complete_handler() {
 psram_spi_inst_t psram_spi_init_clkdiv(PIO pio, int sm, float clkdiv, bool fudge, bool quad) {
     psram_spi_inst_t spi;
     spi.pio = pio;
-    spi.offset = pio_add_program(spi.pio, fudge ? &spi_psram_fudge_program : &spi_psram_program);
     spi.quad = quad;
     spi.fudge = fudge;
+    if (sm == -1) {         //only works reliable when first the PIO is claimed THEN the program added
+        spi.sm = pio_claim_unused_sm(spi.pio, true);
+        PSRAM_DBG_PRINTF("sm %d \r\n",spi.sm);
+    } else {
+        pio_claim_sm_mask(spi.pio, 1<<sm);
+        spi.sm = sm;
+    }
     if (quad) {
         spi.offset = pio_add_program(spi.pio, &qspi_psram_program);
-    }
-    if (sm == -1) {
-        spi.sm = pio_claim_unused_sm(spi.pio, true);
-    } else {
-        spi.sm = sm;
+    }else{
+        spi.offset = pio_add_program(spi.pio, fudge ? &spi_psram_fudge_program : &spi_psram_program);
     }
 #if defined(PSRAM_MUTEX)
     mutex_init(&spi.mtx);
@@ -106,6 +113,7 @@ psram_spi_inst_t psram_spi_init_clkdiv(PIO pio, int sm, float clkdiv, bool fudge
 
     // Write DMA channel setup
     spi.write_dma_chan = dma_claim_unused_channel(true);
+    PSRAM_DBG_PRINTF("wdma %d \r\n",spi.write_dma_chan);
     spi.write_dma_chan_config = dma_channel_get_default_config(spi.write_dma_chan);
     channel_config_set_transfer_data_size(&spi.write_dma_chan_config, DMA_SIZE_8);
     channel_config_set_read_increment(&spi.write_dma_chan_config, true);
@@ -116,6 +124,7 @@ psram_spi_inst_t psram_spi_init_clkdiv(PIO pio, int sm, float clkdiv, bool fudge
 
     // Read DMA channel setup
     spi.read_dma_chan = dma_claim_unused_channel(true);
+    PSRAM_DBG_PRINTF("rdma %d \r\n",spi.read_dma_chan);
     spi.read_dma_chan_config = dma_channel_get_default_config(spi.read_dma_chan);
     channel_config_set_transfer_data_size(&spi.read_dma_chan_config, DMA_SIZE_8);
     channel_config_set_read_increment(&spi.read_dma_chan_config, false);
@@ -127,6 +136,7 @@ psram_spi_inst_t psram_spi_init_clkdiv(PIO pio, int sm, float clkdiv, bool fudge
 #if defined(PSRAM_ASYNC)
     // Asynchronous DMA channel setup
     spi.async_dma_chan = dma_claim_unused_channel(true);
+    PSRAM_DBG_PRINTF("adma %d \r\n",spi.async_dma_chan);
     spi.async_dma_chan_config = dma_channel_get_default_config(spi.async_dma_chan);
     channel_config_set_transfer_data_size(&spi.async_dma_chan_config, DMA_SIZE_8);
     channel_config_set_read_increment(&spi.async_dma_chan_config, true);
@@ -164,7 +174,29 @@ psram_spi_inst_t psram_spi_init_clkdiv(PIO pio, int sm, float clkdiv, bool fudge
 };
 
 psram_spi_inst_t psram_spi_init(PIO pio, int sm) {
-    return psram_spi_init_clkdiv(pio, sm, 1.0f, true, false);
+    //first try exiting QPI mode to check ID in SPI mode (no need to power down in development)
+    psram_spi_inst_t spi = psram_spi_init_clkdiv(pio,sm, PSRAM_CKDIV, true, true);
+
+    busy_wait_us(100);
+    //exit from QPI mode and clean up
+    psram_spi_uninit(spi);
+    busy_wait_us(100);
+
+    spi = psram_spi_init_clkdiv(pio, sm, PSRAM_CKDIV, true, false);
+    
+#ifdef PSRAM_ID_DEBUG
+    uint8_t psram_id_data[8];
+    uint8_t psram_id_cmd[] = {32, 64, 0x9fu,0,0,0}; // get device ID
+    pio_spi_write_read_dma_blocking(&spi, psram_id_cmd, 6, psram_id_data, 8);
+    printf("psram devid %02X kgd %02X\r\n",psram_id_data[0],psram_id_data[1]);
+    for (uint8_t i = 2; i < 8; i++)
+    {
+        printf("%02X ",psram_id_data[i]);
+    }
+    printf("\r\n");
+#endif
+
+    return spi;    
 }
 
 psram_spi_inst_t psram_qpi_init(PIO pio, int sm) {
@@ -178,12 +210,18 @@ psram_spi_inst_t psram_qpi_init(PIO pio, int sm) {
     busy_wait_us(100);
 
     psram_spi_uninit(spi);
-    return psram_spi_init_clkdiv(pio,sm, 1.0, true, true);
+    return psram_spi_init_clkdiv(pio,sm, PSRAM_CKDIV, true, true);
 }
 
 void psram_spi_uninit(psram_spi_inst_t spi) {
+    if (spi.quad) {
+        uint8_t psram_quad_cmd[] = {2, 0, 0xF5u};
+        pio_spi_write_read_dma_blocking(&spi, psram_quad_cmd, 3, 0, 0); // EXIT QPI
+    }
+
 #if defined(PSRAM_ASYNC)
     // Asynchronous DMA channel teardown
+    dma_channel_cleanup(spi.async_dma_chan);
     dma_channel_unclaim(spi.async_dma_chan);
 #if defined(PSRAM_ASYNC_COMPLETE)
     irq_set_enabled(DMA_IRQ_0 + PSRAM_ASYNC_DMA_IRQ, false);
@@ -193,58 +231,69 @@ void psram_spi_uninit(psram_spi_inst_t spi) {
 #endif // defined(PSRAM_ASYNC)
 
     // Write DMA channel teardown
+    dma_channel_cleanup(spi.write_dma_chan);
     dma_channel_unclaim(spi.write_dma_chan);
 
     // Read DMA channel teardown
+    dma_channel_cleanup(spi.read_dma_chan);
     dma_channel_unclaim(spi.read_dma_chan);
 
 #if defined(PSRAM_SPINLOCK)
     int spin_id = spin_lock_get_num(spi.spinlock);
     spin_lock_unclaim(spin_id);
 #endif
-
-    pio_sm_unclaim(spi.pio, spi.sm);
-
+    pio_sm_clear_fifos(spi.pio, spi.sm);
+    
+    //pio_sm_unclaim(spi.pio, spi.sm);      -- You should never unclaim the SM and THEN call it (exit QPI)
+    
     if (spi.quad) {
-        uint8_t psram_quad_cmd[] = {8, 0,0xF5u};
-        pio_spi_write_read_dma_blocking(&spi, psram_quad_cmd, 3, 0, 0); // EXTI QPI
-        pio_remove_program(spi.pio, &qspi_psram_program, spi.offset);
+        pio_remove_program_and_unclaim_sm(&qspi_psram_program, spi.pio, spi.sm, spi.offset);
     } else {
-        pio_remove_program(spi.pio, spi.fudge ? &spi_psram_fudge_program : &spi_psram_program, spi.offset);
+        pio_remove_program_and_unclaim_sm((spi.fudge? &spi_psram_fudge_program : &spi_psram_program), spi.pio, spi.sm, spi.offset);
     }
 }
 
 int test_psram(psram_spi_inst_t* psram_spi, int increment) {
-    PSRAM_DBG_PUTS("Writing PSRAM...");
-    uint8_t deadbeef[8] = {0xd, 0xe, 0xa, 0xd, 0xb, 0xe, 0xe, 0xf};
-    /* uncomment to write 8 bits at a time. the below for loop for 32-bit writes is much faster
-    for (uint32_t addr = 0; addr < (1024 * 1024); ++addr) {
+    uint32_t psram_begin,psram_elapsed;
+    float psram_speed;
+    //puts("Writing8 PSRAM...");
+    psram_begin = time_us_32();
+
+    for (uint32_t addr = 0; addr < (1024*1024); addr += increment) {
         psram_write8(psram_spi, addr, (addr & 0xFF));
         // psram_write8_async(psram_spi, addr, (addr & 0xFF));
     }
-    */
-    for (uint32_t addr = 0; addr < (1024 * 1024); addr += 4) {
-        uint32_t value = (uint32_t)(
-            (((addr + 3) & 0xFF) << 24) |
-            (((addr + 2) & 0xFF) << 16) |
-            (((addr + 1) & 0xFF) << 8)  |
-            (addr & 0XFF));
-        psram_write32(psram_spi, addr, value);
-    }
-    PSRAM_DBG_PUTS("Reading PSRAM...");
-    uint32_t psram_begin = time_us_32();
+    psram_elapsed = time_us_32() - psram_begin;
+    psram_speed = 1000000.0 * 1024.0 * 1024 / psram_elapsed / increment;
+    printf("PSRAM write8  %d B/s\r\n", (uint32_t)psram_speed);
+ 
+    //puts("Reading8 PSRAM...");
+    psram_begin = time_us_32();
     for (uint32_t addr = 0; addr < (1024 * 1024); addr += increment) {
         uint8_t result = psram_read8(psram_spi, addr);
         uint8_t test = (uint8_t)(addr & 0xFF);
         if (test != result) {
-            PSRAM_DBG_PRINTF("\nPSRAM failure at address %x (%x != %x)\n", addr, test, result);
+            printf("PSRAM read8 failure at address %x (org %x != %x read)\r\n", addr, test, result);
             return 1;
         }
-    }
-    uint32_t psram_elapsed = time_us_32() - psram_begin;
-    float psram_speed = 1000000.0 * 1024.0 * 1024 / psram_elapsed / increment;
-    PSRAM_DBG_PRINTF("8 bit: PSRAM read in %d us, %d B/s (target 705600 B/s)\n", psram_elapsed, (uint32_t)psram_speed);
+    }    
+    psram_elapsed = time_us_32() - psram_begin;
+    psram_speed = 1000000.0 * 1024 * 1024 / psram_elapsed / increment;
+    printf("PSRAM read8   %d B/s\r\n", (uint32_t)psram_speed);
 
+    //puts("Writing16 PSRAM...");
+    psram_begin = time_us_32();
+    for (uint32_t addr = 0; addr < (1024 * 1024); addr += (2*increment)) {
+        uint32_t value = (uint16_t)(
+            (((addr + 1) & 0xFF) << 8) |
+            (addr & 0XFF));
+        psram_write16(psram_spi, addr, value);
+    }
+    psram_elapsed = time_us_32() - psram_begin;
+    psram_speed = 1000000.0 * 1024 * 1024 / psram_elapsed / increment;
+    printf("PSRAM write16 %d B/s\r\n", (uint32_t)psram_speed);
+    
+    //puts("Reading16 PSRAM...");
     psram_begin = time_us_32();
     for (uint32_t addr = 0; addr < (1024 * 1024); addr += (2 * increment)) {
         uint16_t result = psram_read16(psram_spi, addr);
@@ -253,14 +302,29 @@ int test_psram(psram_spi_inst_t* psram_spi, int increment) {
             (addr & 0XFF));
         if (test != result
         ) {
-            PSRAM_DBG_PRINTF("PSRAM failure at address %x (%x != %x) ", addr, test, result);
+            printf("PSRAM read16 failure at address %x (org %x != %x read)\r\n", addr, test, result);
             return 1;
         }
     }
     psram_elapsed = (time_us_32() - psram_begin);
     psram_speed = 1000000.0 * 1024 * 1024 / psram_elapsed / increment;
-    PSRAM_DBG_PRINTF("16 bit: PSRAM read in %d us, %d B/s (target 1411200 B/s)\n", psram_elapsed, (uint32_t)psram_speed);
+    printf("PSRAM read16  %d B/s\r\n", (uint32_t)psram_speed);
 
+    //puts("Writing32 PSRAM...");
+    psram_begin = time_us_32();
+    for (uint32_t addr = 0; addr < (1024 * 1024); addr += (4*increment)) {
+        uint32_t value = (uint32_t)(
+            (((addr + 3) & 0xFF) << 24) |
+            (((addr + 2) & 0xFF) << 16) |
+            (((addr + 1) & 0xFF) << 8)  |
+            (addr & 0XFF));
+        psram_write32(psram_spi, addr, value);
+    }
+    psram_elapsed = time_us_32() - psram_begin;
+    psram_speed = 1000000.0 * 1024 * 1024 / psram_elapsed / increment;
+    printf("PSRAM write32 %d B/s\r\n", (uint32_t)psram_speed);
+
+    //puts("Reading32 PSRAM...");
     psram_begin = time_us_32();
     for (uint32_t addr = 0; addr < (1024 * 1024); addr += (4 * increment)) {
         uint32_t result = psram_read32(psram_spi, addr);
@@ -271,12 +335,12 @@ int test_psram(psram_spi_inst_t* psram_spi, int increment) {
             (addr & 0XFF));
         if (test != result
         ) {
-            PSRAM_DBG_PRINTF("PSRAM failure at address %x (%x != %x) ", addr, test, result);
+            printf("PSRAM read32 failure at address %x (org %x != %x read)\r\n", addr, test, result);
             return 1;
         }
     }
     psram_elapsed = (time_us_32() - psram_begin);
     psram_speed = 1000000.0 * 1024 * 1024 / psram_elapsed / increment;
-    PSRAM_DBG_PRINTF("32 bit: PSRAM read in %d us, %d B/s (target 1411200 B/s)\n", psram_elapsed, (uint32_t)psram_speed);
+    printf("PSRAM read32  %d B/s\r\n",  (uint32_t)psram_speed);
     return 0;
 }

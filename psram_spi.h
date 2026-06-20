@@ -45,6 +45,12 @@ SOFTWARE.
  *
  * Project homepage: https://github.com/polpo/rp2040-psram
  */
+ 
+ // !!!!!!!!!!! BURST WRITE AND READ LENGTHS SHOULD BE LIMITED AS THE PSRAM HAS 
+ // !!!!!!!!!!! LIMITED TOLERANCE OF CE_ASSERTED BEFORE AFFECTING THE REFRESH CYCLE
+ //
+ // !!!!!!!!!!!!!  ALSO - ALSO - THE COUNTS ALSO PROBLEMATIC
+ // !!!!!!!!!!!!! AS THE READ/WRITE CYCLE NUMBERS FOR PIO ONLY ACCEPTS UINT8_T
 
 #pragma once
 
@@ -376,8 +382,8 @@ static uint8_t read8_command[] = {
     0           // 8 delay cycles
 };
 static uint8_t read8_quad_command[] = {
-    14,         // 48 bits write
-    2,          // 8 bits read
+    14,         // 14 cycle x4 bits write (2 cmd 6 addr 6 delay)
+    2,          // 2 cycle x4 bits read
     0xebu,      // Fast read command
     0, 0, 0,    // Address
     0, 0, 0     // 6 delay cycles
@@ -679,11 +685,11 @@ static uint8_t write_async_fast_command[134] = {
     0,          // 0 bits read
     0x02u      // Fast write command
 };
-static uint8_t write_quad_async_fast_command[134] = {
-    0,          // n bits write
-    0,          // 0 bits read
-    0x38u      // Fast write command
-};
+// static uint8_t write_quad_async_fast_command[134] = {            //--why even the double buffer??
+    // 0,          // n bits write
+    // 0,          // 0 bits read
+    // 0x38u      // Fast write command
+// };
 /**
  * @brief Write @c count bytes of data to a given address asynchronously to the
  * PSRAM SPI PIO, driven by DMA without CPU involvement.
@@ -694,16 +700,15 @@ static uint8_t write_quad_async_fast_command[134] = {
  * @param count Number of bytes to write.
  */
 __force_inline static void psram_write_async_fast(psram_spi_inst_t* spi, uint32_t addr, const uint8_t* val, const size_t count) {
-    uint8_t* cmd = spi->quad ? write_quad_async_fast_command : write_async_fast_command;
+    write_async_fast_command[2] = (spi->quad)?0x38u:0x02u;              //--just change the command byte
+    write_async_fast_command[0] = (spi->quad)?((4 + count) * 2):((4 + count) * 8);
+    write_async_fast_command[3] = (uint8_t)(addr >> 16);
+    write_async_fast_command[4] = (uint8_t)(addr >> 8);
+    write_async_fast_command[5] = (uint8_t)addr;
 
-    cmd[0] = spi->quad ? (uint8_t)((4 + count) * 2) : (uint8_t)((4 + count) * 8);
-    cmd[3] = (uint8_t)(addr >> 16);
-    cmd[4] = (uint8_t)(addr >> 8);
-    cmd[5] = (uint8_t)addr;
+    memcpy(write_async_fast_command + 6, val, count);
 
-    memcpy(cmd + 6, val, count);
-
-    pio_spi_write_async(spi, cmd, 6 + count);
+    pio_spi_write_async(spi, write_async_fast_command, 6 + count);
 };
 #endif
 
